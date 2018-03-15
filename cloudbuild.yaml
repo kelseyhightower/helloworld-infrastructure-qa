@@ -1,0 +1,140 @@
+#
+# User-defined substitutions:
+#   _CLOUDSDK_COMPUTE_ZONE
+#   _CLOUDSDK_CONTAINER_CLUSTER
+#   _GITHUB_USERNAME
+#   _KMS_KEY
+#   _KMS_KEYRING
+#
+
+steps:
+  # Generate a kubeconfig file
+  - name: 'gcr.io/cloud-builders/gcloud'
+    env:
+      - 'CLOUDSDK_COMPUTE_ZONE=${_CLOUDSDK_COMPUTE_ZONE}'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=${_CLOUDSDK_CONTAINER_CLUSTER}'
+      - 'KUBECONFIG=/kube/config'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        CLUSTER=$$(gcloud config get-value container/cluster)
+        PROJECT=$$(gcloud config get-value core/project)
+        ZONE=$$(gcloud config get-value compute/zone)
+      
+        gcloud container clusters get-credentials "$${CLUSTER}" \
+          --project "$${PROJECT}" \
+          --zone "$${ZONE}"
+    volumes:
+      - name: 'kube'
+        path: /kube
+
+  # Retrieve and decrypt the GitHub Hub configuration. 
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        gsutil cp gs://${PROJECT_ID}-helloworld-configs/hub.enc hub.enc
+
+        gcloud kms decrypt \
+          --ciphertext-file=hub.enc \
+          --plaintext-file=/config/hub \
+          --location=global \
+          --keyring=${_KMS_KEYRING} \
+          --key=${_KMS_KEY}
+    volumes:
+      - name: 'config'
+        path: /config
+
+  # Update the Kubernetes deployment config.
+  - name: 'gcr.io/cloud-builders/gcloud'
+    env:
+      - 'KUBECONFIG=/kube/config'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        kubectl apply --recursive -f kubernetes 
+    volumes:
+      - name: 'kube'
+        path: /kube
+
+  # Create a pull request on the ${_GITHUB_USERNAME}/helloworld-infrastructure-production repo
+  # to update the helloworld deployment configuration.
+  - name: 'gcr.io/hightowerlabs/hub'
+    env:
+      - 'HUB_CONFIG=/config/hub'
+      - 'KUBECONFIG=/kube/config'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        # Extract the container image from the qa helloworld deployment configuration file.
+        CONTAINER_IMAGE=$(kubectl apply --dry-run \
+           -f kubernetes/deployments/helloworld.yaml \
+           -o jsonpath='{.spec.template.spec.containers[?(@.name == "helloworld")].image}')
+
+        ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)")
+
+        hub config --global credential.https://github.com.helper /usr/local/bin/hub-credential-helper
+        hub config --global hub.protocol https
+        hub config --global user.email "$${ACTIVE_ACCOUNT}"
+        hub config --global user.name "Google Container Builder"
+
+
+        # Clone the ${_GITHUB_USERNAME}/helloworld-infrastructure-production repo
+        # and patch the helloworld deployment container image.
+        hub clone "https://github.com/${_GITHUB_USERNAME}/helloworld-infrastructure-production.git"
+
+        cat <<EOF > patch.yaml
+        spec:
+          template:
+            spec:
+              containers:
+                - name: helloworld
+                  image: $${CONTAINER_IMAGE}
+        EOF
+
+        kubectl patch --local -o yaml \
+          -f helloworld-infrastructure-production/kubernetes/deployments/helloworld.yaml \
+          -p "$(cat patch.yaml)" \
+          > helloworld.yaml
+
+        mv helloworld.yaml helloworld-infrastructure-production/kubernetes/deployments/helloworld.yaml
+
+        # Change to the helloworld-infrastructure-production directory
+        # commit the local changes, then issue a pull request.
+        cd helloworld-infrastructure-production
+
+        git checkout -b update-deployment-${BUILD_ID}
+
+        hub add kubernetes/deployments/helloworld.yaml
+ 
+        hub commit -F- <<EOF
+        Update the helloworld deployment
+
+        This commit updates the helloworld deployment container image to:
+
+            $${CONTAINER_IMAGE}
+
+        Build ID: ${BUILD_ID}
+        EOF
+
+        hub push origin update-deployment-${BUILD_ID}
+
+        # Create a pull request to the ${_GITHUB_USERNAME}/helloworld-infrastructure-production repo.
+        hub pull-request -F- <<EOF
+        Update the helloworld deployment
+
+        This commit updates the helloworld deployment container image to:
+
+            $${CONTAINER_IMAGE}
+
+        Build ID: ${BUILD_ID}
+        EOF
+    volumes:
+      - name: 'config'
+        path: /config
+      - name: 'kube'
+        path: /kube
